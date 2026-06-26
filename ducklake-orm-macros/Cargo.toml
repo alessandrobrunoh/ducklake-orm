@@ -2,6 +2,9 @@
 name = "ducklake-orm-macros"
 version = "0.1.0"
 edition = "2024"
+description = "Derive macros for ducklake-orm — #[derive(Table)] and companion attributes."
+repository = "https://github.com/alessandrobrunoh/ducklake-orm"
+license = "MIT"
 
 [lib]
 proc-macro = true

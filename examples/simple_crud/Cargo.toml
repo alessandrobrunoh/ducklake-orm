@@ -1,0 +1,9 @@
+[package]
+name = "simple_crud"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ducklake-orm = { path = "../../ducklake-orm" }
+duckdb = { workspace = true }

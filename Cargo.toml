@@ -1,3 +1,16 @@
 [workspace]
-members = ["ducklake-orm", "ducklake-orm-macros"]
+members = [
+    "ducklake-orm",
+    "ducklake-orm-macros",
+    "examples/simple_crud",
+    "examples/migrations_and_pool",
+]
 resolver = "2"
+
+[workspace.dependencies]
+duckdb  = { version = "1", features = ["r2d2", "chrono"] }
+r2d2    = "0.8"
+serde   = { version = "1", features = ["derive"] }
+toml    = "0.8"
+thiserror = "2"
+chrono  = { version = "0.4", features = ["serde"] }

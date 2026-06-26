@@ -1,0 +1,25 @@
+# ducklake.toml — DuckLake ORM configuration
+# Place this file in your project root and load it with:
+#   DuckLakeConfig::from_file("ducklake.toml")
+
+[database]
+# File path for the DuckDB database.
+# Use ":memory:" for an in-memory database (data is lost on close).
+path = "data/warehouse.duckdb"
+
+[pool]
+# Maximum number of open connections in the pool.
+size = 8
+# Seconds to wait before returning a pool-timeout error.
+connection_timeout_secs = 30
+
+# Remove or comment out this section if you are using plain DuckDB
+# without the DuckLake lakehouse extension.
+[ducklake]
+# Path to the DuckLake catalog database (created automatically if absent).
+catalog_path = "data/catalog.duckdb"
+# SQL alias used to reference the catalog: `catalog_name.schema.table`
+catalog_name = "lake"
+# When true, each pooled connection automatically runs:
+#   INSTALL ducklake; LOAD ducklake; ATTACH '...' AS lake (TYPE DUCKLAKE)
+auto_attach = true
