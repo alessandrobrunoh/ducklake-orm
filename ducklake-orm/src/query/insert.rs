@@ -106,7 +106,7 @@ impl<'conn, T: DuckLakeTable> InsertBuilder<'conn, T> {
     }
 
     fn build_sql(&self) -> String {
-        let cols = T::column_names();
+        let cols = T::insert_columns();
         let tref = table_ref::<T>(self.catalog.as_deref());
         let col_list = cols.join(", ");
         let placeholders = cols
@@ -300,7 +300,7 @@ impl<'conn, T: DuckLakeTable> BulkInsertBuilder<'conn, T> {
     /// automatically by DuckDB when the error occurs.
     pub fn execute(self) -> Result<usize, DuckLakeError> {
         let tref = table_ref::<T>(self.catalog.as_deref());
-        let cols = T::column_names();
+        let cols = T::insert_columns();
         let col_list = cols.join(", ");
         let placeholders = cols
             .iter()

@@ -349,37 +349,33 @@ Enable the `migrations` feature in `Cargo.toml`:
 ducklake-orm = { version = "0.1", features = ["migrations"] }
 ```
 
-Define migrations with `SqlMigration` (or implement the `Migration` trait for Rust-based logic):
+There are three ways to define migrations: **file-based** (recommended for larger projects), **inline SQL** via `SqlMigration`, and **custom Rust logic** via the `Migration` trait.
+
+### File-based migrations (recommended)
+
+Keep your migrations as `.sql` files in a directory and load them all with `Migrator::add_directory`:
+
+```text
+migrations/
+├── V1__create_sales.up.sql
+├── V1__create_sales.down.sql
+├── V2__add_sold_at.up.sql
+├── V2__add_sold_at.down.sql
+└── V3__drop_legacy.up.sql      ← no .down.sql → irreversible
+```
+
+**Naming convention:** `V<version>__<description>.up.sql` and `.down.sql`. Files that don't match are silently ignored (so you can keep `README.md` notes alongside).
 
 ```rust
-use ducklake_orm::migration::{Migrator, SqlMigration};
+use ducklake_orm::migration::Migrator;
 
-let migrator = Migrator::new(&db)
-    .add(SqlMigration::new(
-        1,
-        "create sales table",
-        // up
-        "CREATE TABLE IF NOT EXISTS main.sales (
-             id     BIGINT PRIMARY KEY,
-             amount DOUBLE NOT NULL,
-             region VARCHAR NOT NULL
-         )",
-        // down
-        "DROP TABLE IF EXISTS main.sales",
-    ))
-    .add(SqlMigration::new(
-        2,
-        "add sold_at column",
-        "ALTER TABLE main.sales ADD COLUMN sold_at TIMESTAMP",
-        "ALTER TABLE main.sales DROP COLUMN sold_at",
-    ));
-
-// Apply all pending migrations — safe to call on every startup
-let applied = migrator.run()?;
+let applied = Migrator::new(&db)
+    .add_directory("migrations")?     // discovers, parses, and registers every file
+    .run()?;                            // applies only the pending ones
 println!("{applied} migration(s) applied");
 
 // Inspect status
-for s in migrator.status()? {
+for s in Migrator::new(&db).add_directory("migrations")?.status()? {
     println!(
         "v{:<4} [{:^7}] {}",
         s.version,
@@ -389,17 +385,51 @@ for s in migrator.status()? {
 }
 
 // Roll back the last migration
-migrator.rollback(1)?;
+Migrator::new(&db).add_directory("migrations")?.rollback(1)?;
 ```
 
-### How it works
+Missing `.down.sql` files are allowed: that migration is registered as **non-reversible**, and calling `rollback` on it returns a clear error.
 
-- Applied migrations are tracked in `main._ducklake_migrations` (created automatically).
-- Each migration runs inside a `BEGIN` / `COMMIT` transaction — if it fails, the transaction is rolled back and the migration is not recorded.
-- `run()` is **idempotent**: calling it multiple times applies only the pending migrations.
-- Duplicate version numbers registered in the same `Migrator` are detected before any SQL runs.
+### Inline SQL migrations
+
+For quick setups or tests, define migrations directly in code with `SqlMigration::new`. All string arguments accept either `&'static str` literals or owned `String`s:
+
+```rust
+use ducklake_orm::migration::{Migrator, SqlMigration};
+
+Migrator::new(&db)
+    .add(SqlMigration::new(
+        1,
+        "create sales table",
+        "CREATE TABLE IF NOT EXISTS main.sales (
+             id     BIGINT PRIMARY KEY,
+             amount DOUBLE NOT NULL,
+             region VARCHAR NOT NULL
+         )",
+        "DROP TABLE IF EXISTS main.sales",
+    ))
+    .add(SqlMigration::new(
+        2,
+        "add sold_at column",
+        "ALTER TABLE main.sales ADD COLUMN sold_at TIMESTAMP",
+        "ALTER TABLE main.sales DROP COLUMN sold_at",
+    ))
+    .run()?;
+```
+
+For a migration that cannot be reversed (e.g. `DROP COLUMN`), use `new_irreversible` — no `down` SQL is needed:
+
+```rust
+SqlMigration::new_irreversible(
+    3,
+    "drop legacy column",
+    "ALTER TABLE main.sales DROP COLUMN legacy_flag",
+)
+```
 
 ### Custom migrations (Rust logic)
+
+Implement the `Migration` trait for migrations that need data-aware backfills or conditional logic:
 
 ```rust
 use ducklake_orm::{DuckLakeError, migration::Migration};
@@ -407,7 +437,7 @@ use ducklake_orm::{DuckLakeError, migration::Migration};
 struct SeedData;
 
 impl Migration for SeedData {
-    fn version(&self) -> i64 { 3 }
+    fn version(&self) -> i64 { 4 }
     fn description(&self) -> &str { "seed initial data" }
 
     fn up(&self, conn: &duckdb::Connection) -> Result<(), DuckLakeError> {
@@ -424,6 +454,16 @@ impl Migration for SeedData {
     }
 }
 ```
+
+All three styles can be mixed and matched in the same `Migrator` via `.add(...)`.
+
+### How it works
+
+- Applied migrations are tracked in `main._ducklake_migrations` (created automatically).
+- Each migration runs inside a `BEGIN` / `COMMIT` transaction — if it fails, the transaction is rolled back and the migration is not recorded.
+- `run()` is **idempotent**: calling it multiple times applies only the pending migrations.
+- Duplicate version numbers registered in the same `Migrator` are detected before any SQL runs.
+- Missing `.down.sql` files (or `new_irreversible`) make a migration non-reversible: `rollback` returns a clear error rather than silently skipping.
 
 ---
 
@@ -444,8 +484,9 @@ We provide two complete example crates under `examples/` directory to help you u
 
 2. **`migrations_and_pool`**: Demonstrates connection pooling and schema migrations (requires `migrations` feature).
    - Initializes an `r2d2` connection pool (`DuckLakePool`) with a custom configuration.
-   - Handles versioned database migrations dynamically using the `Migrator` and `SqlMigration`.
-   - Illustrates migration application and transactional rollback.
+   - Loads **file-based** migrations from a `migrations/` directory with `Migrator::add_directory`.
+   - Shows a migration registered in code with `SqlMigration::new_irreversible`.
+   - Demonstrates application, status inspection, and rollback (both successful and refused).
    - Runs with:
      ```bash
      cargo run --bin migrations_and_pool

@@ -63,6 +63,29 @@
 //! # Ok::<(), DuckLakeError>(())
 //! ```
 //!
+//! ## File-based migrations
+//!
+//! For larger projects, prefer keeping migrations as `.sql` files in a
+//! directory and loading them with [`Migrator::add_directory`]:
+//!
+//! ```text
+//! migrations/
+//! ├── V1__create_sales.up.sql
+//! ├── V1__create_sales.down.sql
+//! ├── V2__add_sold_at.up.sql
+//! └── V3__drop_legacy.up.sql      // no .down.sql → irreversible
+//! ```
+//!
+//! ```rust,no_run
+//! use ducklake_orm::{DuckLakeConnection, DuckLakeError};
+//! use ducklake_orm::migration::Migrator;
+//!
+//! let db = DuckLakeConnection::open("warehouse.duckdb")?;
+//! let n = Migrator::new(&db).add_directory("migrations")?.run()?;
+//! println!("{n} migration(s) applied");
+//! # Ok::<(), DuckLakeError>(())
+//! ```
+//!
 //! ## Custom migrations
 //!
 //! Implement the [`Migration`] trait to write migration logic in Rust:

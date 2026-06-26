@@ -1,5 +1,7 @@
 //! Core migration trait and built-in implementations.
 
+use std::borrow::Cow;
+
 use crate::error::DuckLakeError;
 
 // ── Migration trait ───────────────────────────────────────────────────────────
@@ -121,19 +123,22 @@ pub trait Migration: Send + Sync {
 /// ```
 pub struct SqlMigration {
     version: i64,
-    description: &'static str,
-    up_sql: &'static str,
-    down_sql: &'static str,
+    description: Cow<'static, str>,
+    up_sql: Cow<'static, str>,
+    // `None` marks a migration as non-reversible: calling `down` returns an error.
+    down_sql: Option<Cow<'static, str>>,
 }
 
 impl SqlMigration {
-    /// Create a new SQL migration.
+    /// Create a new reversible SQL migration.
     ///
     /// - `version` — unique, monotonically increasing integer.
     /// - `description` — short label stored in the migrations tracking table.
+    ///   Accepts either a `&'static str` literal or an owned `String`.
     /// - `up_sql` — SQL executed when applying the migration. Multiple statements
-    ///   separated by `;` are supported via `execute_batch`.
-    /// - `down_sql` — SQL executed when rolling back the migration.
+    ///   separated by `;` are supported via `execute_batch`. Accepts a `&'static str`
+    ///   or an owned `String` (e.g. loaded from a file).
+    /// - `down_sql` — SQL executed when rolling back the migration. Same ownership rules.
     ///
     /// # Example
     ///
@@ -149,15 +154,47 @@ impl SqlMigration {
     /// ```
     pub fn new(
         version: i64,
-        description: &'static str,
-        up_sql: &'static str,
-        down_sql: &'static str,
+        description: impl Into<Cow<'static, str>>,
+        up_sql: impl Into<Cow<'static, str>>,
+        down_sql: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self {
             version,
-            description,
-            up_sql,
-            down_sql,
+            description: description.into(),
+            up_sql: up_sql.into(),
+            down_sql: Some(down_sql.into()),
+        }
+    }
+
+    /// Create a SQL migration that cannot be rolled back.
+    ///
+    /// Calling [`Migration::down`] on a migration built this way returns an
+    /// [`DuckLakeError::Query`] explaining that the migration is not reversible.
+    /// This is useful for data-destructive `up` scripts (e.g. `DROP COLUMN`,
+    /// `TRUNCATE`, schema refactor) where a meaningful `down` cannot be written,
+    /// and for migrations loaded from a directory that has no `.down.sql` file.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use ducklake_orm::migration::SqlMigration;
+    ///
+    /// let m = SqlMigration::new_irreversible(
+    ///     5,
+    ///     "drop legacy column",
+    ///     "ALTER TABLE main.users DROP COLUMN legacy_flag",
+    /// );
+    /// ```
+    pub fn new_irreversible(
+        version: i64,
+        description: impl Into<Cow<'static, str>>,
+        up_sql: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            version,
+            description: description.into(),
+            up_sql: up_sql.into(),
+            down_sql: None,
         }
     }
 }
@@ -167,17 +204,25 @@ impl Migration for SqlMigration {
         self.version
     }
     fn description(&self) -> &str {
-        self.description
+        &self.description
     }
 
     fn up(&self, conn: &duckdb::Connection) -> Result<(), DuckLakeError> {
-        conn.execute_batch(self.up_sql)?;
+        conn.execute_batch(&self.up_sql)?;
         Ok(())
     }
 
     fn down(&self, conn: &duckdb::Connection) -> Result<(), DuckLakeError> {
-        conn.execute_batch(self.down_sql)?;
-        Ok(())
+        match &self.down_sql {
+            Some(sql) => {
+                conn.execute_batch(sql)?;
+                Ok(())
+            }
+            None => Err(DuckLakeError::Query(format!(
+                "migration v{} ('{}') is not reversible: no down script was provided",
+                self.version, self.description
+            ))),
+        }
     }
 }
 

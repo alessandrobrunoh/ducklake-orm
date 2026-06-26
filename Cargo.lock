@@ -493,6 +493,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ducklake-cli"
+version = "0.1.0"
+
+[[package]]
 name = "ducklake-orm"
 version = "0.1.0"
 dependencies = [

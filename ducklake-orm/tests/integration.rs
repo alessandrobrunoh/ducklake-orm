@@ -722,4 +722,324 @@ mod migration_tests {
             .run();
         assert!(err.is_err());
     }
+
+    // ── Cow<'static, str> acceptance ──
+
+    #[test]
+    fn sql_migration_accepts_owned_strings() {
+        // Previously this would fail to compile because `new` required `&'static str`.
+        let desc = format!("{}", "create t");
+        let up = format!("CREATE TABLE main.t (id BIGINT)");
+        let down = format!("DROP TABLE main.t");
+        let _m = SqlMigration::new(1, desc, up, down);
+    }
+
+    // ── Irreversible migrations ──
+
+    #[test]
+    fn irreversible_migration_applies_but_cannot_rollback() {
+        let db = fresh_db();
+        Migrator::new(&db)
+            .add(SqlMigration::new_irreversible(
+                1,
+                "create t",
+                "CREATE TABLE main.t (id BIGINT)",
+            ))
+            .run()
+            .unwrap();
+
+        // up worked
+        let applied = Migrator::new(&db)
+            .add(SqlMigration::new_irreversible(
+                1,
+                "create t",
+                "CREATE TABLE main.t (id BIGINT)",
+            ))
+            .status()
+            .unwrap();
+        assert!(applied[0].applied);
+
+        // rollback must fail with a clear message
+        let err = Migrator::new(&db)
+            .add(SqlMigration::new_irreversible(
+                1,
+                "create t",
+                "CREATE TABLE main.t (id BIGINT)",
+            ))
+            .rollback(1);
+        let err = err.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not reversible"),
+            "expected error message to mention 'not reversible', got: {msg}"
+        );
+    }
+
+    // ── add_directory ──
+
+    #[test]
+    fn add_directory_loads_and_orders_migrations() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        fs::write(
+            dir_path.join("V2__second.up.sql"),
+            "CREATE TABLE main.u (id BIGINT)",
+        )
+        .unwrap();
+        fs::write(dir_path.join("V2__second.down.sql"), "DROP TABLE main.u").unwrap();
+        fs::write(
+            dir_path.join("V1__first.up.sql"),
+            "CREATE TABLE main.t (id BIGINT)",
+        )
+        .unwrap();
+        fs::write(dir_path.join("V1__first.down.sql"), "DROP TABLE main.t").unwrap();
+        // A file that does not match the convention — should be ignored.
+        fs::write(dir_path.join("README.md"), "this is not a migration").unwrap();
+
+        let db = fresh_db();
+        let applied = Migrator::new(&db)
+            .add_directory(dir_path)
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(applied, 2);
+
+        let status = Migrator::new(&db)
+            .add_directory(dir_path)
+            .unwrap()
+            .status()
+            .unwrap();
+        assert_eq!(status.len(), 2);
+        assert_eq!(status[0].version, 1);
+        assert_eq!(status[1].version, 2);
+        assert!(status[0].applied);
+        assert!(status[1].applied);
+    }
+
+    #[test]
+    fn add_directory_allows_irreversible_migrations() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // up only — no .down.sql → irreversible
+        fs::write(
+            dir_path.join("V1__only_up.up.sql"),
+            "CREATE TABLE main.t (id BIGINT)",
+        )
+        .unwrap();
+
+        let db = fresh_db();
+        let applied = Migrator::new(&db)
+            .add_directory(dir_path)
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(applied, 1);
+
+        // rollback should fail because no .down.sql was provided
+        let err = Migrator::new(&db)
+            .add_directory(dir_path)
+            .unwrap()
+            .rollback(1);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("not reversible"));
+    }
+
+    #[test]
+    fn add_directory_errors_when_up_sql_missing() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Only a down file, no matching up — should be rejected.
+        fs::write(dir_path.join("V1__broken.down.sql"), "DROP TABLE main.t").unwrap();
+
+        let db = fresh_db();
+        let err = Migrator::new(&db).add_directory(dir_path).err().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no .up.sql"),
+            "expected error to mention missing .up.sql, got: {msg}"
+        );
+    }
+}
+
+// ── field attributes: column alias, skip_insert, skip, rename_all ─────────────
+
+#[allow(non_snake_case)]
+mod field_attrs {
+    use super::*;
+    use ducklake_orm::DuckLakeTable;
+
+    // column alias: Rust field `sold_at` → SQL column `created_timestamp`
+    #[derive(Table, Debug, PartialEq, Clone)]
+    #[ducklake(table = "events")]
+    struct Event {
+        pub id: i64,
+        #[ducklake(column = "created_timestamp")]
+        pub sold_at: String,
+    }
+
+    #[test]
+    fn column_alias_select_and_filter() {
+        let db = DuckLakeConnection::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE main.events (id BIGINT, created_timestamp VARCHAR)",
+        )
+        .unwrap();
+        db.insert(Event {
+            id: 1,
+            sold_at: "2025-01-01T00:00:00Z".into(),
+        })
+        .execute()
+        .unwrap();
+
+        // accessor uses the aliased column name in WHERE
+        let rows: Vec<Event> = db
+            .select::<Event>()
+            .filter(Event::sold_at().eq("2025-01-01T00:00:00Z"))
+            .fetch_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sold_at, "2025-01-01T00:00:00Z");
+
+        // trait reports the SQL name, not the Rust name
+        assert_eq!(Event::column_names(), &["id", "created_timestamp"]);
+    }
+
+    // skip_insert: field is a real DB column but generated by the DB
+    #[derive(Table, Debug, PartialEq, Clone)]
+    #[ducklake(table = "auto_ids")]
+    struct AutoId {
+        #[ducklake(skip_insert)]
+        pub id: i64,
+        pub label: String,
+    }
+
+    #[test]
+    fn skip_insert_omits_column_from_insert() {
+        let db = DuckLakeConnection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE main.auto_ids (id BIGINT DEFAULT 42, label VARCHAR)")
+            .unwrap();
+
+        // INSERT must omit `id`; only `label` is bound.
+        db.insert(AutoId {
+            id: 0, // ignored
+            label: "hello".into(),
+        })
+        .execute()
+        .unwrap();
+
+        // `id` is still SELECTed (it's a real column) and picked up the DEFAULT
+        let rows: Vec<AutoId> = db.select::<AutoId>().fetch_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "hello");
+        assert_eq!(rows[0].id, 42);
+
+        assert_eq!(AutoId::column_names(), &["id", "label"]);
+        assert_eq!(AutoId::insert_columns(), &["label"]);
+    }
+
+    #[test]
+    fn skip_insert_with_bulk_insert() {
+        let db = DuckLakeConnection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE main.auto_ids (id BIGINT DEFAULT 0, label VARCHAR)")
+            .unwrap();
+        let inserted = db
+            .insert_many(vec![
+                AutoId { id: 0, label: "a".into() },
+                AutoId { id: 0, label: "b".into() },
+            ])
+            .execute()
+            .unwrap();
+        assert_eq!(inserted, 2);
+    }
+
+    // skip: virtual field that does not exist in the DB
+    #[derive(Table, Debug, PartialEq, Clone)]
+    #[ducklake(table = "products")]
+    struct Product {
+        pub id: i64,
+        pub price: f64,
+        #[ducklake(skip)]
+        pub display: String,
+    }
+
+    #[test]
+    fn skip_field_excluded_from_sql() {
+        let db = DuckLakeConnection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE main.products (id BIGINT, price DOUBLE)")
+            .unwrap();
+        db.insert(Product {
+            id: 1,
+            price: 9.99,
+            display: String::new(), // ignored on insert
+        })
+        .execute()
+        .unwrap();
+
+        let rows: Vec<Product> = db.select::<Product>().fetch_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].price, 9.99);
+        // skipped field is populated via Default
+        assert_eq!(rows[0].display, "");
+
+        // no column accessor generated for skipped fields
+        assert_eq!(Product::column_names(), &["id", "price"]);
+        assert_eq!(Product::insert_columns(), &["id", "price"]);
+    }
+
+    // rename_all = "snake_case" converts PascalCase / camelCase field names
+    #[derive(Table, Debug, PartialEq, Clone)]
+    #[ducklake(table = "users", rename_all = "snake_case")]
+    struct User {
+        pub id: i64,
+        pub firstName: String,
+        pub lastName: String,
+    }
+
+    #[test]
+    fn rename_all_snake_case() {
+        assert_eq!(
+            User::column_names(),
+            &["id", "first_name", "last_name"]
+        );
+
+        let db = DuckLakeConnection::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE main.users (id BIGINT, first_name VARCHAR, last_name VARCHAR)",
+        )
+        .unwrap();
+        db.insert(User {
+            id: 1,
+            firstName: "Ada".into(),
+            lastName: "Lovelace".into(),
+        })
+        .execute()
+        .unwrap();
+
+        let rows: Vec<User> = db
+            .select::<User>()
+            .filter(User::firstName().eq("Ada"))
+            .fetch_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].lastName, "Lovelace");
+    }
+
+    // rename_all = "camelCase" on a snake_case Rust field
+    #[derive(Table, Debug, PartialEq, Clone)]
+    #[ducklake(table = "orders", rename_all = "camelCase")]
+    struct OrderRow {
+        pub id: i64,
+        pub customer_id: i64,
+    }
+
+    #[test]
+    fn rename_all_camel_case() {
+        assert_eq!(OrderRow::column_names(), &["id", "customerId"]);
+    }
 }

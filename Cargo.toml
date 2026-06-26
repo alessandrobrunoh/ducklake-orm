@@ -2,6 +2,7 @@
 members = [
     "ducklake-orm",
     "ducklake-orm-macros",
+    "ducklake-cli",
     "examples/simple_crud",
     "examples/migrations_and_pool",
 ]

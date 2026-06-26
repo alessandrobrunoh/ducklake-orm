@@ -1,90 +1,70 @@
+//! Esempio DuckLake ORM: Connection Pool e Migrazioni file-based.
+//!
+//! Dimostra:
+//! - configurazione di un pool r2d2 (`DuckLakePool`),
+//! - migrazioni **file-based** caricate da una directory con `Migrator::add_directory`,
+//! - convenzione `V<versione>__<descrizione>.up.sql` / `.down.sql`,
+//! - operazioni CRUD su una tabella creata tramite migrazione,
+//! - rollback di una migration reversibile,
+//! - migration irreversibile registrata da codice con `SqlMigration::new_irreversible`.
+
+use std::path::PathBuf;
+
 use ducklake_orm::config::PoolConfig;
 use ducklake_orm::migration::{Migrator, SqlMigration};
-use ducklake_orm::{DuckLakePool, Table};
+use ducklake_orm::DuckLakePool;
 
-// Definiamo un modello per la tabella creata tramite migrazioni
-#[derive(Table, Debug, Clone)]
-#[ducklake(table = "users", schema = "main")]
-pub struct User {
-    #[ducklake(primary_key)]
-    pub id: i64,
-    pub username: String,
-    pub email: String,
+use models::User;
+
+mod models;
+
+fn print_status(status: &[ducklake_orm::migration::MigrationStatus]) {
+    for stat in status {
+        let tag = if stat.applied { "[x]" } else { "[ ]" };
+        println!("  {tag} v{} - {}", stat.version, stat.description);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Esempio DuckLake ORM: Connection Pool & Migrazioni ===");
+    println!("=== Esempio DuckLake ORM: Pool & Migrazioni ===\n");
 
-    // 1. Configurazione del connection pool r2d2
-    let pool_cfg = PoolConfig {
-        size: 5, // Impostiamo la dimensione massima del pool a 5 connessioni
-        ..PoolConfig::default()
-    };
+    // Path della cartella `migrations/` rispetto al crate dell'esempio.
+    // V1 e V2 sono reversibili (hanno `.up.sql` e `.down.sql`).
+    let migrations_dir: PathBuf =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    println!("Cartella migrazioni: {}", migrations_dir.display());
 
-    // Apriamo il pool su un database in-memory.
-    // NOTA: Con DuckDB in-memory, ogni connessione aperta nel pool è indipendente.
-    // Negli ambienti di produzione, usereste il percorso di un file reale per condividere lo stato tra le connessioni del pool.
-    let pool = DuckLakePool::open(":memory:", &pool_cfg)?;
-    println!("Connection pool r2d2 inizializzato con successo.");
-
-    // Preleviamo una connessione dal pool per eseguire le migrazioni
+    // 1. Connection pool r2d2.
+    //    NOTA: con DuckDB in-memory ogni connessione del pool è indipendente;
+    //    usiamo sempre la stessa `conn` per mantenere lo stato.
+    //    In produzione si usa il percorso di un file reale.
+    let pool = DuckLakePool::open(
+        ":memory:",
+        &PoolConfig { size: 5, ..PoolConfig::default() },
+    )?;
     let conn = pool.get()?;
-    println!("Connessione ottenuta con successo dal pool per l'applicazione delle migrazioni.");
+    println!("Connessione ottenuta dal pool.");
 
-    // 2. Definizione delle migrazioni
-    // Definiamo una migrazione con ID versione, descrizione, SQL di up (applicazione) e SQL di down (rollback)
-    let migration_1 = SqlMigration::new(
-        1,
-        "create_users_table",
-        "CREATE TABLE main.users (id BIGINT PRIMARY KEY, username VARCHAR, email VARCHAR)",
-        "DROP TABLE main.users",
-    );
+    // 2. Carica V1 e V2 dalla directory (entrambe reversibili).
+    let migrator = Migrator::from_pooled(&conn).add_directory(&migrations_dir)?;
 
-    // 3. Esecuzione delle migrazioni con il Migrator
-    let mut migrator = Migrator::from_pooled(&conn);
-    migrator = migrator.add(migration_1);
+    println!("\n--- Stato iniziale ---");
+    print_status(&migrator.status()?);
 
-    // Mostriamo lo stato iniziale delle migrazioni
-    println!("\n--- Stato iniziale delle migrazioni ---");
-    let status_before = migrator.status()?;
-    for stat in &status_before {
-        println!(
-            "Versione {}: '{}' - Applicata: {}",
-            stat.version, stat.description, stat.applied
-        );
-    }
+    // 3. Applica le migrazioni pendenti (idempotente).
+    println!("\n--- Applicazione migrazioni da directory ---");
+    let applied = migrator.run()?;
+    println!("Applicate {applied} migrazioni.");
+    print_status(&migrator.status()?);
 
-    // Applichiamo le migrazioni pendenti
-    println!("\n--- Applicazione delle migrazioni ---");
-    let applied_count = migrator.run()?;
-    println!("Applicate {} migrazioni.", applied_count);
-
-    // Verifichiamo il nuovo stato delle migrazioni
-    let status_after = migrator.status()?;
-    for stat in &status_after {
-        println!(
-            "Versione {}: '{}' - Applicata: {}",
-            stat.version, stat.description, stat.applied
-        );
-    }
-
-    // 4. Utilizzo del pool con la tabella creata dalla migrazione
-    println!("\n--- Utilizzo di un'altra connessione dal pool per operazioni CRUD ---");
-    // Preleviamo una nuova connessione
-    let _app_conn = pool.get()?;
-
-    // Poiché DuckDB in-memory isola le connessioni in-memory separate, in questo esempio specifico in-memory dobbiamo
-    // usare la stessa connessione o ricreare lo schema se usiamo un'altra connessione in memoria.
-    // Tuttavia, per dimostrare l'uso tipico di produzione con una connessione del pool dove lo schema esiste,
-    // eseguiamo l'inserimento direttamente. Nel nostro caso, per far sì che l'esempio in-memory funzioni,
-    // usiamo la connessione 'conn' in cui abbiamo appena creato la tabella.
+    // 4. CRUD sulla tabella creata.
+    println!("\n--- Inserimento utenti ---");
     conn.insert(User {
         id: 1,
         username: "alice".to_string(),
         email: "alice@example.com".to_string(),
     })
     .execute()?;
-
     conn.insert(User {
         id: 2,
         username: "bob".to_string(),
@@ -92,32 +72,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .execute()?;
 
-    println!("Record utente inseriti con successo!");
-
-    // Recuperiamo e stampiamo i record inseriti
     let users: Vec<User> = conn.select::<User>().fetch_all()?;
-    println!("Utenti trovati nel database:");
-    for user in &users {
-        println!(" - {:?}", user);
+    println!("Utenti trovati:");
+    for u in &users {
+        println!("  - {u:?}");
     }
 
-    // 5. Rollback della migrazione
-    println!("\n--- Rollback dell'ultima migrazione (1 passo) ---");
-    let rolled_back_count = migrator.rollback(1)?;
-    println!(
-        "Rollback eseguito con successo per {} migrazioni.",
-        rolled_back_count
-    );
+    // 5. Rollback di V2 (reversibile) — successo.
+    println!("\n--- Rollback di 1 step (V2 è reversibile) ---");
+    let rolled = migrator.rollback(1)?;
+    println!("Rollback eseguito per {rolled} migrazioni.");
+    print_status(&migrator.status()?);
 
-    // Verifichiamo lo stato finale delle migrazioni
-    let status_final = migrator.status()?;
-    for stat in &status_final {
-        println!(
-            "Versione {}: '{}' - Applicata: {}",
-            stat.version, stat.description, stat.applied
-        );
+    // 6. Ora registriamo una migration V3 irreversibile da codice
+    //    e mostriamo che il rollback viene rifiutato con un errore chiaro.
+    println!("\n--- Migration irreversibile (V3, da codice) ---");
+    let migrator = migrator.add(SqlMigration::new_irreversible(
+        3,
+        // `description` accetta anche `String` owned, non solo `&'static str`:
+        format!("drop legacy column ({})", "demo"),
+        "ALTER TABLE main.users DROP COLUMN IF EXISTS legacy_flag",
+    ));
+    let applied = migrator.run()?;
+    println!("Applicate {applied} migrazioni.");
+    print_status(&migrator.status()?);
+
+    println!("\n--- Tentativo di rollback di V3 (atteso: errore) ---");
+    match migrator.rollback(1) {
+        Ok(n) => println!("Rollback eseguito per {n} migrazioni (inaspettato)."),
+        Err(e) => println!("Rollback bloccato come previsto:\n  {e}"),
     }
 
-    println!("\n=== Esempio completato con successo ===");
+    println!("\n=== Esempio completato ===");
     Ok(())
 }

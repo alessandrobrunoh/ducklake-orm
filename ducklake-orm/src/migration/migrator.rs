@@ -4,7 +4,7 @@ use duckdb::types::ToSql;
 
 use crate::{connection::DuckLakeConnection, error::DuckLakeError, pool::PooledConnection};
 
-use super::migration::{Migration, MigrationStatus};
+use super::migration::{Migration, MigrationStatus, SqlMigration};
 
 /// The fully-qualified name of the internal migrations tracking table.
 const MIGRATIONS_TABLE: &str = "main._ducklake_migrations";
@@ -144,6 +144,117 @@ impl<'conn> Migrator<'conn> {
     pub fn add(mut self, migration: impl Migration + 'static) -> Self {
         self.migrations.push(Box::new(migration));
         self
+    }
+
+    /// Discover and register every migration file in `dir`.
+    ///
+    /// Files must follow the naming convention used by FluentMigrator / DbUp:
+    ///
+    /// ```text
+    /// V<version>__<description>.up.sql        // required
+    /// V<version>__<description>.down.sql      // optional — omit for irreversible migrations
+    /// ```
+    ///
+    /// `<version>` is an unsigned integer parsed into `i64` (e.g. `V1`, `V20250101`).
+    /// `<description>` is free-form but cannot be empty and must not contain `.`
+    /// before the suffix. Migrations missing their `.up.sql` file are reported as
+    /// an error; missing `.down.sql` is allowed and produces a non-reversible
+    /// migration (see [`SqlMigration::new_irreversible`]).
+    ///
+    /// Files that do not match the pattern are silently ignored, so you can keep
+    /// README / notes alongside the migrations.
+    ///
+    /// # Example
+    ///
+    /// Given a directory layout:
+    ///
+    /// ```text
+    /// migrations/
+    /// ├── V1__create_sales.up.sql
+    /// ├── V1__create_sales.down.sql
+    /// ├── V2__add_sold_at.up.sql
+    /// └── V3__drop_legacy_column.up.sql      // no .down.sql → not reversible
+    /// ```
+    ///
+    /// ```rust,no_run
+    /// use ducklake_orm::{DuckLakeConnection, migration::Migrator};
+    ///
+    /// let db = DuckLakeConnection::open_in_memory()?;
+    /// let applied = Migrator::new(&db)
+    ///     .add_directory("migrations")?
+    ///     .run()?;
+    /// # Ok::<(), ducklake_orm::DuckLakeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`DuckLakeError::Io`] — the directory cannot be read.
+    /// - [`DuckLakeError::Query`] — a migration version has an `.up.sql` missing,
+    ///   the version number cannot be parsed, or the same version is registered
+    ///   twice in the directory.
+    pub fn add_directory<P: AsRef<std::path::Path>>(
+        mut self,
+        dir: P,
+    ) -> Result<Self, DuckLakeError> {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::PathBuf;
+
+        let dir = dir.as_ref();
+
+        #[derive(Default)]
+        struct Entry {
+            description: Option<String>,
+            up: Option<PathBuf>,
+            down: Option<PathBuf>,
+        }
+
+        let mut found: HashMap<i64, Entry> = HashMap::new();
+
+        for dir_entry in fs::read_dir(dir)? {
+            let path = dir_entry?.path();
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            let Some((version, description, is_down)) = parse_migration_filename(file_name)
+            else {
+                continue;
+            };
+
+            let entry = found.entry(version).or_default();
+            entry.description = Some(description.to_string());
+            if is_down {
+                entry.down = Some(path);
+            } else {
+                entry.up = Some(path);
+            }
+        }
+
+        for (version, entry) in found {
+            let description = entry.description.ok_or_else(|| {
+                DuckLakeError::Query(format!(
+                    "migration V{version}: invalid directory entry (missing description)"
+                ))
+            })?;
+            let up_path = entry.up.ok_or_else(|| {
+                DuckLakeError::Query(format!(
+                    "migration V{version} ('{description}'): no .up.sql file found"
+                ))
+            })?;
+            let up_sql = fs::read_to_string(&up_path)?;
+
+            let migration = match entry.down {
+                Some(down_path) => {
+                    let down_sql = fs::read_to_string(down_path)?;
+                    SqlMigration::new(version, description, up_sql, down_sql)
+                }
+                None => SqlMigration::new_irreversible(version, description, up_sql),
+            };
+            self = self.add(migration);
+        }
+
+        Ok(self)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -353,8 +464,7 @@ impl<'conn> Migrator<'conn> {
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let mut statuses: Vec<MigrationStatus> = self
             .migrations
@@ -372,4 +482,35 @@ impl<'conn> Migrator<'conn> {
         statuses.sort_by_key(|s| s.version);
         Ok(statuses)
     }
+}
+
+// ── Filename parsing ──────────────────────────────────────────────────────────
+
+/// Parse a migration filename like `V1__create_users.up.sql` (or `.down.sql`).
+///
+/// Returns `(version, description, is_down)` on success, or `None` if the file
+/// name does not follow the [`Migrator::add_directory`] convention.
+///
+/// Rules:
+/// - Must start with `V`.
+/// - `V` is followed by an ASCII digit run that parses as `i64`.
+/// - Then `__` followed by a non-empty description.
+/// - Then `.up.sql` or `.down.sql`.
+fn parse_migration_filename(name: &str) -> Option<(i64, &str, bool)> {
+    let rest = name.strip_prefix('V')?;
+    let sep = rest.find("__")?;
+    let version: i64 = rest[..sep].parse().ok()?;
+    let after = &rest[sep + 2..];
+
+    let (description, is_down) = if let Some(base) = after.strip_suffix(".down.sql") {
+        (base, true)
+    } else {
+        let base = after.strip_suffix(".up.sql")?;
+        (base, false)
+    };
+
+    if description.is_empty() {
+        return None;
+    }
+    Some((version, description, is_down))
 }
