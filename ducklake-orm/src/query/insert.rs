@@ -315,7 +315,19 @@ impl<'conn, T: DuckLakeTable> BulkInsertBuilder<'conn, T> {
         for record in &self.records {
             let params_owned = record.to_params();
             let refs = params_to_refs_boxed(&params_owned);
-            total += self.raw.execute(&sql, refs.as_slice())?;
+            match self.raw.execute(&sql, refs.as_slice()) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    // Roll back the in-flight transaction before propagating
+                    // the error. The result of the ROLLBACK itself is
+                    // intentionally discarded: if it fails the connection is
+                    // already in an unrecoverable state and the next call will
+                    // surface a clear error; the original failure is the more
+                    // actionable one to report.
+                    let _ = self.raw.execute_batch("ROLLBACK");
+                    return Err(DuckLakeError::Duckdb(e));
+                }
+            }
         }
         self.raw.execute_batch("COMMIT")?;
         Ok(total)

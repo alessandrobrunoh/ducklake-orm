@@ -292,7 +292,15 @@ impl<'conn, T: DuckLakeTable> SelectBuilder<'conn, T> {
 
         let at = match &self.snapshot {
             Some(SnapshotRef::Version(v)) => format!(" AT (VERSION => {v})"),
-            Some(SnapshotRef::Timestamp(ts)) => format!(" AT (TIMESTAMP => '{ts}')"),
+            Some(SnapshotRef::Timestamp(ts)) => {
+                // DuckDB does not accept a bind parameter inside an `AT`
+                // clause, so the timestamp must be interpolated as a string
+                // literal. Escape `'` (and `\` for defence-in-depth) to
+                // neutralise any attempt to break out of the literal and
+                // inject SQL.
+                let escaped = crate::ident::escape_sql_string(ts);
+                format!(" AT (TIMESTAMP => '{escaped}')")
+            }
             None => String::new(),
         };
 

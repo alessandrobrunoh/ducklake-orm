@@ -152,6 +152,8 @@
 pub mod config;
 pub mod connection;
 pub mod error;
+#[allow(dead_code)]
+pub(crate) mod ident;
 pub mod pool;
 pub mod query;
 pub mod schema;

@@ -1043,3 +1043,191 @@ mod field_attrs {
         assert_eq!(OrderRow::column_names(), &["id", "customerId"]);
     }
 }
+
+// ── security: SQL-injection hardening ─────────────────────────────────────────
+//
+// These tests verify the defensive measures added to prevent SQL injection
+// through values that cannot be passed as bind parameters (catalog names,
+// DuckLake paths, and `AT (TIMESTAMP => '...')` literals).
+
+mod security {
+    use ducklake_orm::config::{
+        DatabaseConfig, DuckLakeAttachConfig, DuckLakeConfig, PoolConfig,
+    };
+    use ducklake_orm::{DuckLakeConnection, DuckLakeError};
+
+    // ── attach_ducklake: catalog_name validation ──
+
+    #[test]
+    fn attach_rejects_catalog_name_with_quote() {
+        let mut db = DuckLakeConnection::open_in_memory().unwrap();
+        let err = db
+            .attach_ducklake("x.db", "lake'); DROP SCHEMA main; ATTACH 'y' AS z")
+            .err()
+            .expect("expected attach_ducklake to reject the malicious name");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("catalog_name") && msg.contains("identifier"),
+            "expected identifier error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn attach_rejects_catalog_name_with_semicolon() {
+        let mut db = DuckLakeConnection::open_in_memory().unwrap();
+        let err = db
+            .attach_ducklake("x.db", "lake; DROP SCHEMA main")
+            .err()
+            .expect("expected attach_ducklake to reject the semicolon name");
+        assert!(err.to_string().contains("catalog_name"));
+    }
+
+    #[test]
+    fn attach_rejects_empty_catalog_name() {
+        let mut db = DuckLakeConnection::open_in_memory().unwrap();
+        assert!(db.attach_ducklake("x.db", "").is_err());
+    }
+
+    #[test]
+    fn attach_rejects_name_starting_with_digit() {
+        let mut db = DuckLakeConnection::open_in_memory().unwrap();
+        assert!(db.attach_ducklake("x.db", "1lake").is_err());
+    }
+
+    // ── at_timestamp: escaping of single quotes ──
+
+    #[derive(ducklake_orm::Table, Debug, PartialEq, Clone)]
+    #[ducklake(table = "events", schema = "main")]
+    struct Event {
+        pub id: i64,
+    }
+
+    #[test]
+    fn at_timestamp_with_quote_is_escaped_not_injected() {
+        // A malicious timestamp value. If the literal were not escaped, the
+        // embedded `'` would break out of the SQL string and the query would
+        // either execute the injected statement or fail with a syntax error.
+        // After escaping, DuckDB should fail cleanly while *parsing the
+        // timestamp* (because the payload is not a valid timestamp), NOT while
+        // parsing the SQL statement.
+        let db = DuckLakeConnection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE main.events (id BIGINT)").unwrap();
+        db.insert(Event { id: 1 }).execute().unwrap();
+
+        let payload = "2025'); DROP TABLE main.events; --";
+        let result = db.select::<Event>().at_timestamp(payload).fetch_all();
+
+        // Two acceptable outcomes — either is proof that SQL injection did
+        // NOT occur:
+        //   * `Err(Duckdb)`  — DuckDB rejected the payload as a bad timestamp
+        //     (the literal was parsed as a string and never broke out).
+        //   * `Ok(_)`         — DuckDB was lenient and the table is intact.
+        // What we explicitly must NOT see: the events table being dropped.
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                // Must be a runtime SQL error, not a Rust-side builder error.
+                assert!(matches!(e, DuckLakeError::Duckdb(_)), "got: {e:?}");
+                assert!(
+                    !msg.to_lowercase().contains("syntax error"),
+                    "if the literal were not escaped, DuckDB would have hit a \
+                     syntax error mid-statement; instead it got past parsing \
+                     and rejected the timestamp value. Error: {msg}"
+                );
+            }
+            Ok(_) => {}
+        }
+
+        // Decisive invariant: the table must still exist and contain our row.
+        let count = db.select::<Event>().count().unwrap();
+        assert_eq!(
+            count, 1,
+            "events table was modified — SQL injection succeeded!"
+        );
+    }
+
+    // ── config: catalog_name validated at load time ──
+
+    #[test]
+    fn config_rejects_malicious_catalog_name() {
+        let toml = r#"
+            [database]
+            path = ":memory:"
+
+            [ducklake]
+            catalog_path = "x.db"
+            catalog_name = "x'); DROP SCHEMA main; --"
+            auto_attach = true
+        "#;
+        let err = DuckLakeConfig::from_toml(toml).err().expect("bad catalog_name should be rejected");
+        assert!(err.to_string().contains("catalog_name"));
+    }
+
+    #[test]
+    fn config_rejects_zero_pool_size() {
+        let toml = r#"
+            [database]
+            path = ":memory:"
+
+            [pool]
+            size = 0
+        "#;
+        assert!(DuckLakeConfig::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn config_rejects_huge_pool_size() {
+        let toml = format!(
+            r#"
+            [database]
+            path = ":memory:"
+
+            [pool]
+            size = {}
+            "#,
+            u32::MAX
+        );
+        assert!(DuckLakeConfig::from_toml(&toml).is_err());
+    }
+
+    #[test]
+    fn config_accepts_valid_setup() {
+        // Sanity check — make sure validation doesn't false-positive on
+        // normal configurations.
+        let toml = r#"
+            [database]
+            path = ":memory:"
+
+            [pool]
+            size = 8
+
+            [ducklake]
+            catalog_path = "data/catalog.duckdb"
+            catalog_name = "lake"
+            auto_attach = true
+        "#;
+        let cfg = DuckLakeConfig::from_toml(toml).expect("valid config should parse");
+        assert_eq!(cfg.pool.size, 8);
+    }
+
+    // ── config: programmatic construction also catches issues via from_config ──
+
+    #[test]
+    fn from_config_validates_catalog_name() {
+        let cfg = DuckLakeConfig {
+            database: DatabaseConfig {
+                path: ":memory:".into(),
+            },
+            pool: PoolConfig::default(),
+            ducklake: Some(DuckLakeAttachConfig {
+                catalog_path: "x.db".into(),
+                catalog_name: "bad name".into(), // contains a space
+                auto_attach: true,
+            }),
+        };
+        let err = ducklake_orm::DuckLakePool::from_config(&cfg)
+            .err()
+            .expect("expected from_config to reject the bad catalog_name");
+        assert!(err.to_string().contains("catalog_name"));
+    }
+}

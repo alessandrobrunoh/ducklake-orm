@@ -194,10 +194,16 @@ impl DuckLakeConnection {
         catalog_path: &str,
         catalog_name: &str,
     ) -> Result<(), DuckLakeError> {
+        // `catalog_name` is interpolated as a bare SQL identifier (no quotes),
+        // so it MUST be validated to prevent SQL injection. `catalog_path`
+        // appears inside a single-quoted string literal, so we escape it.
+        crate::ident::validate_identifier(catalog_name, "catalog_name")?;
+        let escaped_path = crate::ident::escape_sql_string(catalog_path);
+
         self.inner
             .execute_batch("INSTALL ducklake; LOAD ducklake;")?;
         self.inner.execute(
-            &format!("ATTACH '{catalog_path}' AS {catalog_name} (TYPE DUCKLAKE)"),
+            &format!("ATTACH '{escaped_path}' AS {catalog_name} (TYPE DUCKLAKE)"),
             [],
         )?;
         self.catalog = Some(catalog_name.to_string());

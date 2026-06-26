@@ -35,7 +35,7 @@
 use std::time::Duration;
 
 use duckdb::DuckdbConnectionManager;
-use r2d2::Pool;
+use r2d2::{ManageConnection, Pool};
 
 use crate::{
     config::{DuckLakeAttachConfig, DuckLakeConfig, PoolConfig},
@@ -83,7 +83,7 @@ use crate::{
 /// # Ok::<(), ducklake_orm::DuckLakeError>(())
 /// ```
 pub struct DuckLakePool {
-    inner: Pool<DuckdbConnectionManager>,
+    inner: Pool<DuckLakeManager>,
     ducklake: Option<DuckLakeAttachConfig>,
 }
 
@@ -114,9 +114,13 @@ impl DuckLakePool {
     /// # Ok::<(), ducklake_orm::DuckLakeError>(())
     /// ```
     pub fn open(path: &str, pool_cfg: &PoolConfig) -> Result<Self, DuckLakeError> {
-        let manager = DuckdbConnectionManager::file(path)?;
+        let size = sanitize_pool_size(pool_cfg.size);
+        let manager = DuckLakeManager {
+            inner: DuckdbConnectionManager::file(path)?,
+            init: None,
+        };
         let pool = Pool::builder()
-            .max_size(pool_cfg.size)
+            .max_size(size)
             .connection_timeout(Duration::from_secs(pool_cfg.connection_timeout_secs))
             .build(manager)?;
         Ok(Self {
@@ -131,12 +135,14 @@ impl DuckLakePool {
     /// path, pool size, timeout, and optional DuckLake catalog settings all from
     /// the config struct (which is typically loaded from `ducklake.toml`).
     ///
-    /// If `config.ducklake` is set and `auto_attach` is `true`, every connection
-    /// checked out of the pool will automatically run:
+    /// If `config.ducklake` is set and `auto_attach` is `true`, each new
+    /// physical connection created by the pool will automatically run:
     /// ```sql
     /// INSTALL ducklake; LOAD ducklake;
     /// ATTACH '<catalog_path>' AS <catalog_name> (TYPE DUCKLAKE);
     /// ```
+    /// This initialisation happens exactly once per underlying connection
+    /// (not on every checkout), so recycled connections are not re-attached.
     ///
     /// # Errors
     ///
@@ -152,9 +158,20 @@ impl DuckLakePool {
     /// # Ok::<(), ducklake_orm::DuckLakeError>(())
     /// ```
     pub fn from_config(cfg: &DuckLakeConfig) -> Result<Self, DuckLakeError> {
-        let manager = DuckdbConnectionManager::file(&cfg.database.path)?;
+        // Validate the catalog name early (better UX than failing on the first
+        // `get()`). The pool path itself is delegated to DuckDB's opener.
+        if let Some(dl) = &cfg.ducklake {
+            if dl.auto_attach {
+                crate::ident::validate_identifier(&dl.catalog_name, "ducklake.catalog_name")?;
+            }
+        }
+        let size = sanitize_pool_size(cfg.pool.size);
+        let manager = DuckLakeManager {
+            inner: DuckdbConnectionManager::file(&cfg.database.path)?,
+            init: cfg.ducklake.clone(),
+        };
         let pool = Pool::builder()
-            .max_size(cfg.pool.size)
+            .max_size(size)
             .connection_timeout(Duration::from_secs(cfg.pool.connection_timeout_secs))
             .build(manager)?;
         Ok(Self {
@@ -174,16 +191,20 @@ impl DuckLakePool {
     /// dropped the underlying `duckdb::Connection` is returned to the pool
     /// and can be reused by the next caller.
     ///
-    /// If `auto_attach` is enabled (see [`DuckLakeAttachConfig`](crate::config::DuckLakeAttachConfig)),
-    /// the DuckLake catalog is attached to the connection before it is handed
-    /// to the caller.
+    /// If `auto_attach` is enabled (see
+    /// [`DuckLakeAttachConfig`](crate::config::DuckLakeAttachConfig)), the
+    /// DuckLake catalog is attached to the underlying connection when it is
+    /// **first created** (not on every checkout). Recycled connections keep
+    /// their existing attachment.
     ///
     /// # Errors
     ///
     /// - [`DuckLakeError::Pool`] — if the timeout expired before a connection
     ///   became available.
-    /// - [`DuckLakeError::Duckdb`] — if the `auto_attach` SQL fails (extension
-    ///   not found, catalog file unreachable, etc.).
+    /// - [`DuckLakeError::Duckdb`] — if the `auto_attach` SQL fails on a freshly
+    ///   created connection (extension not found, catalog file unreachable,
+    ///   etc.). Errors thrown while initialising a brand-new connection are
+    ///   surfaced from `get()` on the call that triggered the creation.
     ///
     /// # Example
     ///
@@ -199,20 +220,12 @@ impl DuckLakePool {
     /// # Ok::<(), ducklake_orm::DuckLakeError>(())
     /// ```
     pub fn get(&self) -> Result<PooledConnection<'_>, DuckLakeError> {
+        // NOTE: DuckLake initialisation (INSTALL / LOAD / ATTACH) now happens
+        // exactly once per physical connection inside `DuckLakeManager::connect`.
+        // Previously this method re-ran ATTACH on every checkout, which (a)
+        // would fail on the second checkout of a recycled connection with
+        // "catalog already attached", and (b) was a redundant round-trip.
         let conn = self.inner.get()?;
-
-        if let Some(dl) = &self.ducklake {
-            if dl.auto_attach {
-                conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
-                conn.execute(
-                    &format!(
-                        "ATTACH '{}' AS {} (TYPE DUCKLAKE)",
-                        dl.catalog_path, dl.catalog_name
-                    ),
-                    [],
-                )?;
-            }
-        }
 
         Ok(PooledConnection {
             inner: conn,
@@ -257,7 +270,7 @@ impl DuckLakePool {
 /// # Ok::<(), ducklake_orm::DuckLakeError>(())
 /// ```
 pub struct PooledConnection<'pool> {
-    pub(crate) inner: r2d2::PooledConnection<DuckdbConnectionManager>,
+    pub(crate) inner: r2d2::PooledConnection<DuckLakeManager>,
     pub(crate) catalog: Option<String>,
     pub(crate) _marker: std::marker::PhantomData<&'pool ()>,
 }
@@ -346,5 +359,69 @@ impl<'pool> PooledConnection<'pool> {
         let refs = params_to_refs(params);
         let rows = stmt.query_map(refs.as_slice(), |row| T::from_row(row))?;
         rows.map(|r| r.map_err(DuckLakeError::Duckdb)).collect()
+    }
+}
+
+// ── Internal: r2d2 connection manager wrapper ──────────────────────────────────
+
+/// r2d2 manager that wraps [`DuckdbConnectionManager`] and runs the optional
+/// DuckLake `INSTALL` / `LOAD` / `ATTACH` initialisation **exactly once** per
+/// physical connection (in [`ManageConnection::connect`]), instead of on every
+/// pool checkout.
+///
+/// This fixes two bugs in the previous implementation:
+///
+/// 1. **Repeated `ATTACH` failure.** Re-checking out a recycled connection
+///    re-ran `ATTACH` against an already-attached catalog, which DuckDB
+///    rejects with "catalog already attached".
+/// 2. **Redundant work.** Every checkout paid for `INSTALL`/`LOAD`/`ATTACH`
+///    even though the connection had already been initialised.
+pub(crate) struct DuckLakeManager {
+    inner: DuckdbConnectionManager,
+    init: Option<DuckLakeAttachConfig>,
+}
+impl ManageConnection for DuckLakeManager {
+    type Connection = duckdb::Connection;
+    type Error = duckdb::Error;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let conn = self.inner.connect()?;
+        if let Some(dl) = self.init.as_ref().filter(|d| d.auto_attach) {
+            conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
+            // `catalog_name` was validated at config load time; `catalog_path`
+            // is escaped as a single-quoted SQL string literal.
+            let escaped_path = crate::ident::escape_sql_string(&dl.catalog_path);
+            conn.execute_batch(&format!(
+                "ATTACH '{escaped_path}' AS {} (TYPE DUCKLAKE)",
+                dl.catalog_name
+            ))?;
+        }
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        self.inner.is_valid(conn)
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        self.inner.has_broken(conn)
+    }
+}
+
+/// Clamp `requested` into a sane range.
+///
+/// A `pool.size` of `0` would deadlock the pool (r2d2 panics or never returns
+/// a connection), and an unbounded value (e.g. `u32::MAX` from a typo in
+/// `ducklake.toml`) would risk exhausting file descriptors / memory. We
+/// therefore coerce `0` to the default (4) and anything above
+/// [`MAX_POOL_SIZE`](crate::ident::MAX_POOL_SIZE) to that ceiling, rather than
+/// rejecting the configuration outright — this preserves the principle of
+/// least surprise for the common foot-guns without failing at startup.
+fn sanitize_pool_size(requested: u32) -> u32 {
+    const DEFAULT: u32 = 4;
+    match requested {
+        0 => DEFAULT,
+        n if n > crate::ident::MAX_POOL_SIZE => crate::ident::MAX_POOL_SIZE,
+        n => n,
     }
 }

@@ -258,6 +258,41 @@ impl DuckLakeConfig {
     /// # Ok::<(), ducklake_orm::DuckLakeError>(())
     /// ```
     pub fn from_toml(content: &str) -> Result<Self, DuckLakeError> {
-        toml::from_str(content).map_err(|e| DuckLakeError::Config(e.to_string()))
+        let config: DuckLakeConfig =
+            toml::from_str(content).map_err(|e| DuckLakeError::Config(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+impl DuckLakeConfig {
+    /// Cross-field validation performed after deserialization.
+    ///
+    /// Currently checks:
+    ///
+    /// - `pool.size` is non-zero and within the safety ceiling.
+    /// - When `ducklake.auto_attach` is `true`, `catalog_name` is a valid SQL
+    ///   identifier (it ends up interpolated unquoted in `ATTACH … AS <name>`).
+    ///
+    /// Errors are surfaced as [`DuckLakeError::Config`].
+    fn validate(&self) -> Result<(), DuckLakeError> {
+        if self.pool.size == 0 {
+            return Err(DuckLakeError::Config(
+                "pool.size must be greater than 0".into(),
+            ));
+        }
+        if self.pool.size > crate::ident::MAX_POOL_SIZE {
+            return Err(DuckLakeError::Config(format!(
+                "pool.size {} exceeds the safety ceiling of {}",
+                self.pool.size,
+                crate::ident::MAX_POOL_SIZE
+            )));
+        }
+        if let Some(dl) = &self.ducklake {
+            if dl.auto_attach {
+                crate::ident::validate_identifier(&dl.catalog_name, "ducklake.catalog_name")?;
+            }
+        }
+        Ok(())
     }
 }
