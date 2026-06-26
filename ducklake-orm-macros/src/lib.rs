@@ -1,0 +1,141 @@
+use proc_macro::TokenStream;
+use proc_macro2::Span;
+use quote::quote;
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
+
+/// Derive macro that implements `DuckLakeTable` for a struct and generates
+/// type-safe column accessor methods used in query builders.
+///
+/// # Attributes
+/// - `#[ducklake(table = "name")]` — override the SQL table name (default: snake_case struct name)
+/// - `#[ducklake(schema = "name")]` — override the schema name (default: "main")
+/// - `#[ducklake(primary_key)]` on a field — marks the primary key column
+///
+/// # Example
+/// ```ignore
+/// #[derive(Table, Debug)]
+/// #[ducklake(table = "sales", schema = "main")]
+/// pub struct Sale {
+///     #[ducklake(primary_key)]
+///     pub id: i64,
+///     pub amount: f64,
+///     pub region: String,
+/// }
+/// ```
+#[proc_macro_derive(Table, attributes(ducklake))]
+pub fn derive_table(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+
+    let default_table = to_snake_case(&struct_name.to_string());
+    let mut table_name = default_table;
+    let mut schema_name = "main".to_string();
+
+    for attr in &input.attrs {
+        if attr.path().is_ident("ducklake") {
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("table") {
+                    let value: syn::LitStr = meta.value()?.parse()?;
+                    table_name = value.value();
+                } else if meta.path.is_ident("schema") {
+                    let value: syn::LitStr = meta.value()?.parse()?;
+                    schema_name = value.value();
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let named_fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => &fields.named,
+            _ => {
+                return syn::Error::new(
+                    Span::call_site(),
+                    "#[derive(Table)] only supports structs with named fields",
+                )
+                .to_compile_error()
+                .into()
+            }
+        },
+        _ => {
+            return syn::Error::new(Span::call_site(), "#[derive(Table)] only supports structs")
+                .to_compile_error()
+                .into()
+        }
+    };
+
+    let field_idents: Vec<_> = named_fields
+        .iter()
+        .map(|f| f.ident.as_ref().unwrap())
+        .collect();
+
+    let field_name_strs: Vec<String> = field_idents.iter().map(|f| f.to_string()).collect();
+
+    let field_indices: Vec<usize> = (0..field_idents.len()).collect();
+
+    let col_methods: Vec<_> = field_idents
+        .iter()
+        .map(|ident| {
+            let col_name = ident.to_string();
+            quote! {
+                pub fn #ident() -> ::ducklake_orm::query::ColumnExpr {
+                    ::ducklake_orm::query::ColumnExpr::new(#col_name)
+                }
+            }
+        })
+        .collect();
+
+    let from_row_fields = field_idents.iter().zip(field_indices.iter()).map(|(ident, idx)| {
+        quote! { #ident: row.get(#idx)? }
+    });
+
+    let to_params_fields = field_idents.iter().map(|ident| {
+        quote! {
+            Box::new(self.#ident.clone()) as Box<dyn ::duckdb::types::ToSql>
+        }
+    });
+
+    let expanded = quote! {
+        impl ::ducklake_orm::schema::DuckLakeTable for #struct_name {
+            fn table_name() -> &'static str {
+                #table_name
+            }
+
+            fn schema_name() -> &'static str {
+                #schema_name
+            }
+
+            fn column_names() -> &'static [&'static str] {
+                &[#(#field_name_strs),*]
+            }
+
+            fn from_row(row: &::duckdb::Row<'_>) -> ::duckdb::Result<Self> {
+                Ok(Self {
+                    #(#from_row_fields),*
+                })
+            }
+
+            fn to_params(&self) -> Vec<Box<dyn ::duckdb::types::ToSql>> {
+                vec![#(#to_params_fields),*]
+            }
+        }
+
+        impl #struct_name {
+            #(#col_methods)*
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}

@@ -1,0 +1,16 @@
+[package]
+name = "ducklake-orm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ducklake-orm-macros = { path = "../ducklake-orm-macros" }
+duckdb = "1"
+thiserror = "2"
+
+[features]
+default = []
+bundled = ["duckdb/bundled"]
+
+[dev-dependencies]
+tempfile = "3"

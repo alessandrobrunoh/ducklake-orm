@@ -1,0 +1,4 @@
+[env]
+# Path to the DuckDB shared library installed via `brew install duckdb`.
+# Remove this if you use the `bundled` feature instead.
+DUCKDB_LIB_DIR = "/opt/homebrew/lib"
