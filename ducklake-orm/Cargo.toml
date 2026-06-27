@@ -9,7 +9,7 @@ keywords = ["duckdb", "ducklake", "orm", "lakehouse", "sql"]
 categories = ["database"]
 
 [dependencies]
-ducklake-orm-macros = { path = "../ducklake-orm-macros" }
+ducklake-orm-macros = { version = "0.1.0", path = "../ducklake-orm-macros" }
 duckdb    = { workspace = true }
 r2d2      = { workspace = true }
 serde     = { workspace = true }
