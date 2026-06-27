@@ -1,15 +1,23 @@
 [package]
 name = "ducklake-orm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Type-safe Rust ORM for DuckLake — compile-time query validation, connection pools, and DuckLake-native time travel."
 repository = "https://github.com/alessandrobrunoh/ducklake-orm"
 license = "MIT"
+readme = "README.md"
 keywords = ["duckdb", "ducklake", "orm", "lakehouse", "sql"]
 categories = ["database"]
+exclude = [
+    ".cargo/",
+    "ducklake-cli/",
+    "examples/",
+    "ducklake.toml",
+    "target/",
+]
 
 [dependencies]
-ducklake-orm-macros = { version = "0.1.0", path = "../ducklake-orm-macros" }
+ducklake-orm-macros = { version = "0.1.1", path = "../ducklake-orm-macros" }
 duckdb    = { workspace = true }
 r2d2      = { workspace = true }
 serde     = { workspace = true }

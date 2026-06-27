@@ -1,10 +1,13 @@
 [package]
 name = "ducklake-orm-macros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Derive macros for ducklake-orm — #[derive(Table)] and companion attributes."
 repository = "https://github.com/alessandrobrunoh/ducklake-orm"
 license = "MIT"
+readme = "README.md"
+categories = ["database"]
+exclude = ["target/"]
 
 [lib]
 proc-macro = true
