@@ -2,8 +2,10 @@
 name = "ducklake-orm"
 version = "0.1.1"
 edition = "2024"
+authors = ["Alessandro Bruno <alessandro.brunoh@gmail.com>"]
 description = "Type-safe Rust ORM for DuckLake — compile-time query validation, connection pools, and DuckLake-native time travel."
 repository = "https://github.com/alessandrobrunoh/ducklake-orm"
+documentation = "https://docs.rs/ducklake-orm"
 license = "MIT"
 readme = "README.md"
 keywords = ["duckdb", "ducklake", "orm", "lakehouse", "sql"]

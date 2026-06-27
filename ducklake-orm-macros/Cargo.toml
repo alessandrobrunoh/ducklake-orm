@@ -2,10 +2,13 @@
 name = "ducklake-orm-macros"
 version = "0.1.1"
 edition = "2024"
+authors = ["Alessandro Bruno <alessandro.brunoh@gmail.com>"]
 description = "Derive macros for ducklake-orm — #[derive(Table)] and companion attributes."
 repository = "https://github.com/alessandrobrunoh/ducklake-orm"
+documentation = "https://docs.rs/ducklake-orm-macros"
 license = "MIT"
 readme = "README.md"
+keywords = ["duckdb", "ducklake", "orm", "macros", "derive"]
 categories = ["database"]
 exclude = ["target/"]
 

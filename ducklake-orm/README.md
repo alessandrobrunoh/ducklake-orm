@@ -1,5 +1,9 @@
 # ducklake-orm
 
+[![crates.io](https://img.shields.io/crates/v/ducklake-orm.svg)](https://crates.io/crates/ducklake-orm)
+[![docs.rs](https://docs.rs/ducklake-orm/badge.svg)](https://docs.rs/ducklake-orm)
+[![license](https://img.shields.io/crates/l/ducklake-orm.svg)](LICENSE)
+
 A type-safe, compile-time-checked ORM for [DuckLake](https://ducklake.select) and plain [DuckDB](https://duckdb.org), written in Rust.
 
 ## Features
